@@ -11,6 +11,11 @@ import os
 LOGDIR = 'logs'
 LOGLEVEL = 'info'
 
+# Web server
+
+COINSTREAM_HOSTNAME = 'localhost'
+COINSTREAM_PORT = 9090
+
 # Prices
 
 PRICE_HISTORY_RESOLUTION = 60
@@ -25,7 +30,7 @@ POLONIEX = {
         'close_handshake_timeout': 60.0,
     },
     'pull_api': {
-        'max_concurrent_connections': 5,
+        'max_concurrent_connections': 2,
     }
 }
 
@@ -46,3 +51,11 @@ def init_settings(cli_args=None) -> None:
 
     if not os.path.exists(LOGDIR):
         os.mkdir(LOGDIR)
+
+    if cli_args.hostname is not None:
+        global COINSTREAM_HOSTNAME
+        COINSTREAM_HOSTNAME = cli_args.hostname
+    if cli_args.port is not None:
+        global COINSTREAM_PORT
+        COINSTREAM_PORT = cli_args.port
+

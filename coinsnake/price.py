@@ -4,6 +4,8 @@
 #
 # price.py is a part of coinsnake and is licenced under the MIT licence.
 
+from typing import Iterable
+
 import six
 from twisted.internet import task
 import txaio
@@ -64,24 +66,24 @@ class PriceHistory(object):
         fmt_string = '{}: {:.8f}'.format(self.ticker, self.current)
         intervals = (1, 5, 15, 60, 360, 720, 1440, 2880)
 
+        index = 0
         for i, val in enumerate(intervals):
             if len(self.history) > val:
+                index += 1
                 # Swap from minutes to hours when we have enough records
                 if val < 60:
                     fmt_string += ' %dm: {:.2f}%%' % val
                 else:
                     fmt_string += ' %dh: {:.2f}%%' % (val / 60)
             else:
-                # If we cannot compare two points, just return the current value
-                if i == 0:
-                    return fmt_string
-                else:
-                    # Calculates the percent wise change from the current price to the different time intervals
-                    changes = (
-                        (self.current - self.history[-1 * x]) * 100 / self.history[-1 * x] for x in intervals[:i]
-                    )
+                break
 
-                    return fmt_string.format(*changes)
+        # Calculates the percent wise change from the current price to the different time intervals
+        changes = tuple(
+            (self.current - self.history[-1 * x]) * 100 / self.history[-1 * x] for x in intervals[:index]
+        )
+
+        return fmt_string.format(*changes)
 
 
 class PriceTracker(object):
@@ -123,6 +125,29 @@ class PriceTracker(object):
 
         self.tickers[ticker_label].add(price)
 
+    def add_all(self, ticker_label: str, prices: Iterable, interval: int) -> None:
+        """
+        Registers all the provided price points, assuming they are aggregated over
+        the provided interval (in seconds). Prices must be sorted with newest entries last
+        :param ticker_label: The label for the currency pair
+        :param prices: A list of price points
+        :param interval: The number of seconds elapsed between each price point
+        :return: None
+        """
+
+        if ticker_label not in self.tickers:
+            self.tickers[ticker_label] = PriceHistory(ticker_label)
+
+        ph = self.tickers[ticker_label]
+
+        price_points = []
+        duplications = interval / PRICE_HISTORY_RESOLUTION
+        for p in prices:
+            price_points.extend(p for _ in range(int(duplications)))
+
+        ph.history = price_points
+        self.log.info(str(ph))
+
     def get(self, ticker_label: str) -> PriceHistory:
         """
         Retrieve the price history object for a given currency pair
@@ -143,7 +168,7 @@ class PriceTracker(object):
         """
 
         if self._process_buffers_task is None:
-            self._process_buffers_task = task.LoopingCall(self._process_buffers)
+            self._process_buffers_task = task.LoopingCall(self.process_buffers)
             self._process_buffers_task.start(PRICE_HISTORY_RESOLUTION, now=False)
             self.log.info('Started price buffer processing at {} second interval'.format(PRICE_HISTORY_RESOLUTION))
 
@@ -159,7 +184,16 @@ class PriceTracker(object):
             self._process_buffers_task = None
             self.log.info('Stopped price buffer processing task')
 
-    def _process_buffers(self) -> None:
+    @property
+    def num_tickers(self) -> int:
+        """
+        Returns the number of registered tickers on this price tracker
+        :return: An integer
+        """
+
+        return len(self.tickers)
+
+    def process_buffers(self) -> None:
         """
         Aggregates buffered price points for all registered currency pairs
         :return: None

@@ -4,14 +4,18 @@
 #
 # poloniex.py is a part of coinsnake and is licenced under the MIT licence
 
-from autobahn.twisted.component import Component
-from treq import json_content
-from twisted.internet.defer import inlineCallbacks
+from time import time
+
 import txaio
+from autobahn.twisted.component import Component, run
+from treq import json_content
+from twisted.internet import reactor
+from twisted.internet.defer import inlineCallbacks
+from twisted.internet.task import deferLater
 
 from coinsnake.price import PriceTracker
 from coinsnake.settings import POLONIEX
-from coinsnake.webclient import WebClient
+from coinsnake.web.client import WebClient
 
 
 class Poloniex(object):
@@ -46,9 +50,6 @@ class Poloniex(object):
         Poloniex.push_api.on_join(self.on_join)
         Poloniex.push_api.on_leave(self.on_leave)
         Poloniex.push_api.on_disconnect(self.on_disconnect)
-
-        # Retrieve all available currency pairs from the public REST API
-        self.get_all_tickers()
 
     def on_connect(self, *args, **kwargs):
         """
@@ -150,5 +151,60 @@ class Poloniex(object):
                     self.price_tracker.add(ticker, float(data['last']))
 
             self.log.info('Finished processing all tickers')
+            self.get_history_for_all_tickers()
 
-        self.web_client.get('https://poloniex.com/public?command=returnTicker', cb)
+        self.web_client.get('https://poloniex.com/public', cb, params={'command': 'returnTicker'})
+
+    def get_history_for_all_tickers(self) -> None:
+        """
+        Fetches the history for all registered tickers, with an interval of 300 seconds between each price
+        point. All price points are partitioned into 1min chunks in the price tracker.
+        :return: None
+        """
+
+        self.log.info('Retrieving ticker history for {} tickers'.format(self.price_tracker.num_tickers))
+
+        queue = []
+        # Schedule requests for all registered tickers
+        for ticker in self.price_tracker.tickers.keys():
+            params = {
+                'command': 'returnChartData',
+                'currencyPair': ticker,
+                'start': int(time() - 3240 * 60),
+                'end': int(time()),
+                'period': 300,
+            }
+            queue.append(params)
+
+        @inlineCallbacks
+        def cb(response):
+            history = yield json_content(response)
+            last = str(response.request.absoluteURI).split('?')
+            last = last[1]
+            last = last.split('&')
+            last = [x.split('=') for x in last]
+            for a, b in last:
+                if a == 'currencyPair':
+                    last = b
+                    break
+
+            # Add the entire price history for this currency pair
+            self.price_tracker.add_all(last, map(lambda x: x.get('close', 0.0), history), 300)
+
+            if queue:
+                deferLater(
+                    reactor,
+                    0.5,
+                    self.web_client.get,
+                    'https://poloniex.com/public',
+                    cb,
+                    params=queue.pop(0)
+                )
+            else:
+                # Start running all components
+                run(self.push_api)
+
+            self.log.info('Processed {} price points for {}'.format(len(history), last))
+
+        if queue:
+            self.web_client.get('https://poloniex.com/public', cb, params=queue.pop(0))
