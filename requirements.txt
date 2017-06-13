@@ -1,0 +1,6 @@
+# Core depencendies
+git+git@github.com:/crossbario/autobahn-python.git@ec65b6669153b1c32321daabbfad62c1dba19c0a#egg=autobahn
+twisted>=17.1.0
+pyopenssl>=17.0.0
+service_identity>=17.0.0
+treq>=17.3.1
