@@ -4,18 +4,24 @@
 #
 # price.py is a part of coinsnake and is licenced under the MIT licence.
 
+import time
 from typing import Iterable
 
+from autobahn.util import ObservableMixin
 import six
 from twisted.internet import task
 import txaio
 
 from coinsnake.settings import PRICE_HISTORY_RESOLUTION
 
+CHANGE_INTERVALS = (1, 5, 15, 60, 360, 720, 1440, 2880)
+
 
 class PriceHistory(object):
     """
-    PriceHistory performs bookkeeping on the variations in price over time for a given ticker
+    PriceHistory performs bookkeeping on the variations in price over time for a given ticker.
+    History is divided into tuples of (high, low, open, close, volume)
+    Buffers are stored as tuples of (last, volume)
     """
 
     def __init__(self, ticker: str):
@@ -27,19 +33,43 @@ class PriceHistory(object):
         self.log = txaio.make_logger()
         self.ticker = ticker.upper()
         self.history = list()
-        self.current = 0.0
+        self.last = 1.0
         self._buffer = list()
 
-    def add(self, price: float) -> None:
+    def add(self, price: float, volume: float) -> None:
         """
         Record a price point
         :param price: The current value
+        :param volume: The volume reported in the ticker
         :return: None
         """
 
-        self.current = price
-        self._buffer.append(price)
+        self.last = price
+        self._buffer.append((price, volume))
         self.log.info(str(self))
+
+    @property
+    def changes(self):
+        """
+        Returns a tuple of percent wise changes from now to the last
+        1, 5, 15, 60, 120, 360, 720, 1440 and 2880 minutes.
+        :return:
+        """
+
+        max_history = len(self.history)
+
+        if max_history < 2:
+            return tuple(0.0 for _ in CHANGE_INTERVALS)
+
+        indexes = []
+        for i, val in enumerate(CHANGE_INTERVALS):
+            if val <= max_history:
+                indexes.append(CHANGE_INTERVALS[i])
+            else:
+                indexes.append(indexes[i-1])
+
+        # Index 3 in history tuples are the closing price
+        return tuple((self.last - self.history[-1 * x][3]) * 100 / self.history[-1 * x][3] for x in indexes)
 
     def process_buffer(self) -> None:
         """
@@ -48,10 +78,25 @@ class PriceHistory(object):
         :return: None
         """
 
-        if len(self._buffer) > 0:
-            self.history.append(sum(self._buffer) / len(self._buffer))
+        if self._buffer:
+            p_value, p_volume = self._buffer.pop(0)
+
+            p_high = p_value
+            p_low = p_value
+            p_open = p_value
+            p_close = p_value
+
+            for val, vol in self._buffer:
+                if val < p_low:
+                    p_low = val
+                elif val > p_high:
+                    p_high = val
+                p_close = val
+                p_volume += vol
+
+            self.history.append((p_high, p_low, p_open, p_close, p_volume))
         else:
-            self.history.append(self.current)
+            self.history.append((self.last, self.last, self.last, self.last, 0.0))
 
         self._buffer.clear()
 
@@ -63,7 +108,7 @@ class PriceHistory(object):
         :return: String representation of this price history object
         """
 
-        fmt_string = '{}: {:.8f}'.format(self.ticker, self.current)
+        fmt_string = '{}: {:.8f}'.format(self.ticker, self.last)
         intervals = (1, 5, 15, 60, 360, 720, 1440, 2880)
 
         index = 0
@@ -78,15 +123,10 @@ class PriceHistory(object):
             else:
                 break
 
-        # Calculates the percent wise change from the current price to the different time intervals
-        changes = tuple(
-            (self.current - self.history[-1 * x]) * 100 / self.history[-1 * x] for x in intervals[:index]
-        )
-
-        return fmt_string.format(*changes)
+        return fmt_string.format(*self.changes)
 
 
-class PriceTracker(object):
+class PriceTracker(ObservableMixin):
     """
     A PriceTracker maintains a table of ticker exchange rate history, with various metrics available
     """
@@ -96,15 +136,17 @@ class PriceTracker(object):
         Construct a new PriceTracker instance
         """
 
+        super().__init__()
         self.log = txaio.make_logger()
         self.tickers = dict()
         self._process_buffers_task = None
 
-    def add(self, ticker_label: str, price: float) -> None:
+    def add(self, ticker_label: str, price: float, volume: float) -> None:
         """
         Registers a new price value for a given currency pair
         :param ticker_label: The label for the currency pair
         :param price: The current price value
+        :param volume: The volume since last update
         :return: None
         """
 
@@ -120,15 +162,24 @@ class PriceTracker(object):
 
             raise TypeError(error_msg)
 
+        if not isinstance(volume, float):
+            error_msg = 'volume type {} not a float'.format(type(volume))
+            self.log.error(error_msg)
+
+            raise TypeError(error_msg)
+
         if ticker_label not in self.tickers:
             self.tickers[ticker_label] = PriceHistory(ticker_label)
 
-        self.tickers[ticker_label].add(price)
+        self.tickers[ticker_label].add(price, volume)
+        self.fire('cs.ticker.update', ticker_label, str(self.tickers[ticker_label]), event_label='cs.ticker.update')
 
     def add_all(self, ticker_label: str, prices: Iterable, interval: int) -> None:
         """
         Registers all the provided price points, assuming they are aggregated over
-        the provided interval (in seconds). Prices must be sorted with newest entries last
+        the provided interval (in seconds).
+        Expects prices to be on (high, low, open, close, volume) format.
+        Prices must be sorted with newest entries last.
         :param ticker_label: The label for the currency pair
         :param prices: A list of price points
         :param interval: The number of seconds elapsed between each price point
@@ -141,12 +192,27 @@ class PriceTracker(object):
         ph = self.tickers[ticker_label]
 
         price_points = []
-        duplications = interval / PRICE_HISTORY_RESOLUTION
+        duplications = int(interval / PRICE_HISTORY_RESOLUTION)
+
+        # For eace price interval, create copies to fill 1 minute intervals and spread values accordingly
         for p in prices:
-            price_points.extend(p for _ in range(int(duplications)))
+            duplicated = list(list(p) for _ in range(duplications))
+            p_close = p[3]
+            for i in range(duplications):
+                # Spread the total volume over all points
+                duplicated[i][4] /= duplications
+                # Set all close points to the open point, since we are saving the close value for last
+                duplicated[i][3] = duplicated[i][2]
+
+            duplicated[duplications - 1][3] = p_close
+
+            price_points.extend(duplicated)
 
         ph.history = price_points
+        ph.last = price_points[-1][3]
+
         self.log.info(str(ph))
+        self.fire('cs.ticker.update', ticker_label, str(ph), event_label='cs.ticker.update')
 
     def get(self, ticker_label: str) -> PriceHistory:
         """
@@ -200,6 +266,15 @@ class PriceTracker(object):
         """
 
         self.log.info('Processing price buffers')
+        self.fire('cs.ticker.processing_buffers', event_label='cs.ticker.processing_buffers')
+
+        start_time = time.time()
 
         for ticker in self.tickers.values():
             ticker.process_buffer()
+
+        self.fire(
+            'cs.message',
+            event_label='cs.message',
+            message='Price buffer processing took {:.3f} seconds.'.format(time.time() - start_time)
+        )

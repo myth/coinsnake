@@ -7,18 +7,20 @@
 from time import time
 
 import txaio
-from autobahn.twisted.component import Component, run
+from autobahn.twisted.component import Component
+from autobahn.util import ObservableMixin
+from autobahn.wamp import component
 from treq import json_content
 from twisted.internet import reactor
 from twisted.internet.defer import inlineCallbacks
-from twisted.internet.task import deferLater
+from twisted.internet.task import deferLater, react
 
 from coinsnake.price import PriceTracker
 from coinsnake.settings import POLONIEX
 from coinsnake.web.client import WebClient
 
 
-class Poloniex(object):
+class Poloniex(ObservableMixin):
     """
     Constructs a Poloniex API object that supports the Push API WAMP (WebSockets) protocol,
     as well as the standard HTTP REST API.
@@ -42,7 +44,7 @@ class Poloniex(object):
         """
         Construct a Poloniex API wrapper
         """
-
+        super().__init__()
         self.log = txaio.make_logger()
 
         # Register all event listeners and map to local methods
@@ -65,6 +67,8 @@ class Poloniex(object):
         self.log.debug(repr(protocol))
         self.log.debug('{}'.format(kwargs))
 
+        self.fire('cs.poloniex.push_api.connect', event_label='cs.poloniex.push_api.connect')
+
     def on_disconnect(self, *args, **kwargs):
         """
         WAMP Client tcp disconnect event
@@ -76,6 +80,8 @@ class Poloniex(object):
         self.log.info('Disconnected from Poloniex Push API')
         self.log.debug('{}'.format(args))
         self.log.debug('{}'.format(kwargs))
+
+        self.fire('cs.poloniex.push_api.disconnect', event_label='cs.poloniex.push_api.disconnect')
 
     @inlineCallbacks
     def on_join(self, *args, **kwargs):
@@ -91,6 +97,8 @@ class Poloniex(object):
         self.log.info('Successfully joined Poloniex Push API, subcribing to ticker stream')
         self.log.debug(', '.join(repr(a) for a in args))
         self.log.debug(', '.join('%s:%s' % (repr(k), repr(v)) for k, v in kwargs))
+
+        self.fire('cs.poloniex.push_api.join', event_label='cs.poloniex.push_api.join')
 
         # Start periodically aggregating buffered price points to regular intervals
         self.price_tracker.start()
@@ -108,6 +116,8 @@ class Poloniex(object):
         self.log.info('Leaving Poloniex Push API session')
         self.log.debug(', '.join(repr(a) for a in args))
         self.log.debug(', '.join('%s:%s' % (repr(k), repr(v)) for k, v in kwargs))
+
+        self.fire('cs.poloniex.push_api.leave', event_label='cs.poloniex.push_api.leave')
 
         # Stop the periodic price point aggregation task, since we aren't receiving any input at the moment
         self.price_tracker.stop()
@@ -129,7 +139,7 @@ class Poloniex(object):
         if len(args) == 10:
             self.log.debug('{0}: {1} A:{2} B:{3} {4} V:{5} H:{8} L:{9}'.format(*args))
             label, last, ask, bid, change, volume, adj_volume, is_frozen, high, low = args
-            self.price_tracker.add(label, float(last))
+            self.price_tracker.add(label, float(last), float(volume))
         else:
             self.log.warn('Received ticker update of length {}: {}'.format(len(args), args))
 
@@ -148,7 +158,7 @@ class Poloniex(object):
             # Add the latest exchange rate for each currency pair to initialize the price tracker
             for ticker, data in tickers.items():
                 if data['isFrozen'] == '0':
-                    self.price_tracker.add(ticker, float(data['last']))
+                    self.price_tracker.add(ticker, float(data['last']), float(data['baseVolume']))
 
             self.log.info('Finished processing all tickers')
             self.get_history_for_all_tickers()
@@ -179,17 +189,26 @@ class Poloniex(object):
         @inlineCallbacks
         def cb(response):
             history = yield json_content(response)
-            last = str(response.request.absoluteURI).split('?')
-            last = last[1]
-            last = last.split('&')
-            last = [x.split('=') for x in last]
-            for a, b in last:
+            currency = str(response.request.absoluteURI).split('?')
+            currency = currency[1]
+            currency = currency.split('&')
+            currency = [x.split('=') for x in currency]
+            for a, b in currency:
                 if a == 'currencyPair':
-                    last = b
+                    currency = b
                     break
 
             # Add the entire price history for this currency pair
-            self.price_tracker.add_all(last, map(lambda x: x.get('close', 0.0), history), 300)
+            self.price_tracker.add_all(currency, map(
+                lambda x: (
+                    float(x.get('high')),
+                    float(x.get('low')),
+                    float(x.get('open')),
+                    float(x.get('close')),
+                    float(x.get('volume'))
+                ),
+                history
+            ), 300)
 
             if queue:
                 deferLater(
@@ -201,10 +220,11 @@ class Poloniex(object):
                     params=queue.pop(0)
                 )
             else:
-                # Start running all components
-                run(self.push_api)
+                self.log.info('Connecting to Poloniex Push API')
+                self.fire('cs.poloniex.push_api.connecting', event_label='cs.poloniex.push_api.connecting')
+                react(component._run, (self.push_api,))
 
-            self.log.info('Processed {} price points for {}'.format(len(history), last))
+            self.log.info('Processed {} price points for {}'.format(len(history), currency))
 
         if queue:
             self.web_client.get('https://poloniex.com/public', cb, params=queue.pop(0))

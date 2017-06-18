@@ -8,6 +8,14 @@ from autobahn.twisted.websocket import listenWS, WebSocketServerFactory, WebSock
 from twisted.internet import reactor
 from txaio import start_logging
 
+from coinsnake import VERSION
+from coinsnake.message import create_envelope, serialize_message
+
+HELLO_MESSAGE = {
+    'event': 'cs.hello',
+    'message': 'CoinSnake v{}'.format(VERSION)
+}
+
 
 class CoinStreamProtocol(WebSocketServerProtocol):
     """
@@ -29,7 +37,7 @@ class CoinStreamProtocol(WebSocketServerProtocol):
         """
 
         if not is_binary:
-            msg = "{} from {}".format(payload.decode('utf8'), self.peer)
+            msg = payload.decode('utf8')
             self.factory.broadcast(msg)
 
     def onOpen(self) -> None:
@@ -73,7 +81,15 @@ class CoinStreamServerFactory(WebSocketServerFactory):
         """
 
         if client not in self.clients:
+            client.sendMessage(serialize_message(create_envelope(HELLO_MESSAGE)))
+
             self.clients.append(client)
+
+            client.sendMessage(serialize_message(create_envelope({
+                'event': 'cs.user_count',
+                'users': len(self.clients)
+            })))
+
             self.log.info('Client connected: {}'.format(client.peer))
 
     def unregister(self, client) -> None:

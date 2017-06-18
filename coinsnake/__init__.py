@@ -4,4 +4,4 @@
 #
 # __init__.py is a part of coinsnake and is licenced under the MIT licence.
 
-VERSION = '0.0.1'
+VERSION = '0.1.0'

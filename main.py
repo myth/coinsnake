@@ -11,6 +11,7 @@ from twisted.internet import reactor
 import txaio
 
 from coinsnake import VERSION
+from coinsnake.event import EventDispatcher, VALID_EVENTS
 from coinsnake.poloniex import Poloniex
 from coinsnake.settings import init_settings, COINSTREAM_HOSTNAME, COINSTREAM_PORT
 from coinsnake.web.server import make_server
@@ -40,6 +41,13 @@ def main() -> int:
     poloniex.get_all_tickers()
 
     coinstream = make_server(COINSTREAM_HOSTNAME, COINSTREAM_PORT)
+    events = EventDispatcher(coinstream)
+
+    for event in VALID_EVENTS:
+        if event == 'cs.ticker.update':
+            poloniex.price_tracker.on('cs.ticker.update', events.handle_ticker)
+        else:
+            poloniex.on(event, events.handle_generic_event)
 
     reactor.run()
 

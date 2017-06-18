@@ -13,7 +13,7 @@ LOGLEVEL = 'info'
 
 # Web server
 
-COINSTREAM_HOSTNAME = 'localhost'
+COINSTREAM_HOSTNAME = '127.0.0.1'
 COINSTREAM_PORT = 9090
 
 # Prices
