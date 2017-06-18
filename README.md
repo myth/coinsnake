@@ -1,3 +1,3 @@
 # CoinSnake
 
-It's a :snake: that trades :coin:
+It's a :snake: that trades :moneybag:
